@@ -56,6 +56,21 @@ An enterprise-ready text-to-SQL analytics agent designed with **LangGraph**, fea
 
 ---
 
+## Quickstart (Windows .bat Launcher)
+
+Double-click or run [`run.bat`](file:///c:/Users/Abhi/Downloads/a5/run.bat) to launch the interactive menu:
+```cmd
+run.bat
+```
+Or run directly via command-line flags:
+- `run.bat all` - Seeds database, runs all 15 tests, and launches the UI dashboard
+- `run.bat ui` - Launches Streamlit analytics dashboard directly
+- `run.bat test` - Runs full automated test suite (`pytest`)
+- `run.bat seed` - Seeds sample `orders` and `products` tables
+- `run.bat install` - Installs Python dependencies
+
+---
+
 ## Installation
 
 ### 1. Configure `.env` file
