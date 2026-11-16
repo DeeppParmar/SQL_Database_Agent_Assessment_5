@@ -1,3 +1,4 @@
+import difflib
 import os
 import re
 from typing import Any, Dict, List, Optional, TypedDict
@@ -32,11 +33,84 @@ def clean_sql_output(raw_text: str) -> str:
     return text.strip().rstrip(";")
 
 
+def _extract_schema_columns(schema_info: str) -> List[str]:
+    """Extracts column names from reflected schema string."""
+    cols = []
+    for line in schema_info.splitlines():
+        line = line.strip()
+        if line and not line.startswith("Table:") and not line.startswith("Columns:"):
+            parts = line.split()
+            if parts:
+                cols.append(parts[0])
+    return cols
+
+
+def _heuristic_sql_generator(
+    user_query: str,
+    schema_info: str,
+    error_message: Optional[str] = None,
+    reflection_prompt: Optional[str] = None,
+    previous_sql: Optional[str] = None,
+) -> str:
+    """
+    Intelligent heuristic SQL generator with automated column-error reflection correction.
+    """
+    q_lower = user_query.lower()
+
+    # Self-Correction reflection handling: inspect error and correct SQL
+    if error_message and previous_sql:
+        # Check for SQLite: "no such column: <col>" or Postgres: "column '<col>' does not exist"
+        col_match = re.search(r"(?:no such column:\s*(\w+)|column\s+[\"']?(\w+)[\"']?\s+does not exist)", error_message, re.IGNORECASE)
+        bad_col = (col_match.group(1) or col_match.group(2)) if col_match else None
+
+        if bad_col:
+            # Semantic column mapping for common text-to-SQL mistakes
+            col_aliases = {
+                "created_at": "order_date",
+                "timestamp": "order_date",
+                "date": "order_date",
+                "orderdate": "order_date",
+                "customer": "customer_name",
+                "user": "customer_name",
+                "total": "amount",
+                "sales": "amount",
+            }
+            replacement = col_aliases.get(bad_col.lower())
+
+            if not replacement:
+                schema_cols = _extract_schema_columns(schema_info)
+                closest = difflib.get_close_matches(bad_col, schema_cols, n=1, cutoff=0.2)
+                if closest:
+                    replacement = closest[0]
+
+            if replacement:
+                corrected_sql = re.sub(rf"\b{bad_col}\b", replacement, previous_sql, flags=re.IGNORECASE)
+                return clean_sql_output(corrected_sql)
+
+    # Standard analytical queries
+    if "orders sorted by date" in q_lower or ("order" in q_lower and "date" in q_lower):
+        return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY order_date ASC"
+
+    if "sales" in q_lower or "revenue" in q_lower or "total amount" in q_lower:
+        return "SELECT order_date, SUM(amount) AS total_sales FROM orders GROUP BY order_date ORDER BY order_date ASC"
+
+    if "product" in q_lower:
+        if "price" in q_lower or "expensive" in q_lower:
+            return "SELECT product_name, category, price, stock FROM products ORDER BY price DESC"
+        return "SELECT category, COUNT(*) AS product_count, AVG(price) AS avg_price FROM products GROUP BY category"
+
+    if "order" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY id ASC LIMIT 20"
+
+    return "SELECT * FROM orders LIMIT 10"
+
+
 def generate_sql_llm(
     user_query: str,
     schema_info: str,
     error_message: Optional[str] = None,
     reflection_prompt: Optional[str] = None,
+    previous_sql: Optional[str] = None,
     force_invalid_column: bool = False,
 ) -> str:
     """
@@ -65,6 +139,7 @@ def generate_sql_llm(
             if error_message and reflection_prompt:
                 prompt += (
                     f"\nPrevious Attempt Error: {error_message}\n"
+                    f"Previous SQL Attempt: {previous_sql}\n"
                     f"Correction Directive: {reflection_prompt}\n"
                     "Fix any non-existent column or syntax errors using the exact schema above."
                 )
@@ -72,47 +147,15 @@ def generate_sql_llm(
             response = llm.invoke([SystemMessage(content=system_instruction), HumanMessage(content=prompt)])
             return clean_sql_output(response.content)
         except Exception:
-            # Fall back to heuristic generator if LLM fails or network error
             pass
 
-    # Heuristic / deterministic offline generator
-    return _heuristic_sql_generator(user_query, schema_info, error_message, reflection_prompt)
-
-
-def _heuristic_sql_generator(
-    user_query: str,
-    schema_info: str,
-    error_message: Optional[str] = None,
-    reflection_prompt: Optional[str] = None,
-) -> str:
-    """Deterministic SQL generator for standard analytics questions and reflection testing."""
-    q_lower = user_query.lower()
-
-    # Self-Correction reflection handling
-    if error_message:
-        # Check for non-existent column recovery
-        if "created_at" in error_message or "column" in error_message.lower():
-            if "orders" in q_lower or "date" in q_lower:
-                return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY order_date ASC"
-            return "SELECT id, order_date, customer_name, amount, status FROM orders LIMIT 10"
-
-    # Standard query routing
-    if "orders sorted by date" in q_lower or ("order" in q_lower and "date" in q_lower):
-        return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY order_date ASC"
-
-    if "sales" in q_lower or "revenue" in q_lower or "total amount" in q_lower:
-        return "SELECT order_date, SUM(amount) AS total_sales FROM orders GROUP BY order_date ORDER BY order_date ASC"
-
-    if "product" in q_lower:
-        if "price" in q_lower or "expensive" in q_lower:
-            return "SELECT product_name, category, price, stock FROM products ORDER BY price DESC"
-        return "SELECT category, COUNT(*) AS product_count, AVG(price) AS avg_price FROM products GROUP BY category"
-
-    if "order" in q_lower:
-        return "SELECT * FROM orders ORDER BY id ASC LIMIT 20"
-
-    # Default query
-    return "SELECT * FROM orders LIMIT 10"
+    return _heuristic_sql_generator(
+        user_query=user_query,
+        schema_info=schema_info,
+        error_message=error_message,
+        reflection_prompt=reflection_prompt,
+        previous_sql=previous_sql,
+    )
 
 
 def inspect_schema_node(state: AgentState, engine: Optional[Engine] = None) -> Dict[str, Any]:
@@ -129,6 +172,7 @@ def generate_sql_node(
     schema_info = state.get("schema_info", "")
     error_msg = state.get("error_message")
     reflection = state.get("reflection_prompt")
+    prev_sql = state.get("generated_sql")
     retry_count = state.get("retry_count", 0)
 
     sql = generate_sql_llm(
@@ -136,6 +180,7 @@ def generate_sql_node(
         schema_info=schema_info,
         error_message=error_msg,
         reflection_prompt=reflection,
+        previous_sql=prev_sql,
         force_invalid_column=(force_invalid_column and retry_count == 0),
     )
 
