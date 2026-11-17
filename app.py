@@ -99,14 +99,17 @@ with st.sidebar:
         "Quick Example Queries:",
         options=[
             "-- Select an example query --",
+            "Show orders sorted by amount",
             "Show orders sorted by date",
-            "DROP TABLE orders; --",
-            "SELECT * FROM orders WHERE 1=1",
+            "Sort orders by customer",
+            "Show pending orders",
             "Total sales revenue by order date",
             "Count orders by status",
             "List all products in Electronics",
             "What is the most expensive product?",
             "Orders with amount greater than 200",
+            "DROP TABLE orders; --",
+            "SELECT * FROM orders WHERE 1=1",
             "<script>alert('xss')</script>",
             "SELECT customer_name, amount FROM orders WHERE amount > 100",
         ],
@@ -273,9 +276,18 @@ if res:
             chart_c1, chart_c2 = st.columns([1, 3])
 
             with chart_c1:
-                y_axis = st.selectbox("Metric Column (Y-axis):", options=numeric_cols, index=0)
+                # Smart Y-axis default: prefer amount/revenue/price/stock over id
+                preferred_y = ["amount", "total_revenue", "total_spent", "price", "stock",
+                               "order_count", "daily_revenue", "avg_price", "average_order_amount"]
+                y_default = next((numeric_cols.index(c) for c in preferred_y if c in numeric_cols), 0)
+                y_axis = st.selectbox("Metric Column (Y-axis):", options=numeric_cols, index=y_default)
+
                 x_options = non_numeric_cols if non_numeric_cols else numeric_cols
-                x_axis = st.selectbox("Dimension Column (X-axis):", options=x_options, index=0)
+                # Smart X-axis default: prefer customer_name/product_name/order_date/status/category over id
+                preferred_x = ["customer_name", "product_name", "order_date", "status",
+                               "category", "date", "product_name"]
+                x_default = next((x_options.index(c) for c in preferred_x if c in x_options), 0)
+                x_axis = st.selectbox("Dimension Column (X-axis):", options=x_options, index=x_default)
                 chart_type = st.selectbox("Chart Type:", options=["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot"], index=0)
 
             with chart_c2:

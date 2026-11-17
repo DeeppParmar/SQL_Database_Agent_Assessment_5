@@ -96,15 +96,40 @@ def _heuristic_sql_generator(
                 corrected_sql = re.sub(rf"\b{bad_col}\b", replacement, previous_sql, flags=re.IGNORECASE)
                 return clean_sql_output(corrected_sql)
 
-    # 3. Specific status filtering
-    if "pending" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Pending' ORDER BY id ASC"
-    if "completed" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Completed' ORDER BY id ASC"
-    if "cancelled" in q_lower or "canceled" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Cancelled' ORDER BY id ASC"
+    # 3. Sorting by a specific column (must come BEFORE generic "order" catch-all)
+    # Matches: "sorted by amount", "ordered by price", "sort orders by amount", "by amount"
+    sort_match = re.search(
+        r"(?:(?:sorted?\s+by|order(?:ed)?\s+by|rank(?:ed)?\s+by|arrange(?:d)?\s+by)\s+|(?:^|\s)by\s+)"
+        r"(amount|price|stock|order_date|date|customer_name|customer|status)",
+        q_lower,
+    )
+    if sort_match:
+        col_raw = sort_match.group(1)
+        # Map aliases to real column names
+        col_map = {
+            "amount": ("orders", "amount", "DESC"),
+            "price": ("products", "price", "DESC"),
+            "stock": ("products", "stock", "ASC"),
+            "order_date": ("orders", "order_date", "ASC"),
+            "date": ("orders", "order_date", "ASC"),
+            "customer_name": ("orders", "customer_name", "ASC"),
+            "customer": ("orders", "customer_name", "ASC"),
+            "status": ("orders", "status", "ASC"),
+        }
+        tbl, col, direction = col_map.get(col_raw, ("orders", "amount", "DESC"))
+        if tbl == "orders":
+            return f"SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY {col} {direction}"
+        return f"SELECT product_name, category, price, stock FROM products ORDER BY {col} {direction}"
 
-    # 4. Counting & Cardinality queries
+    # 4. Specific status filtering
+    if "pending" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Pending' ORDER BY amount DESC"
+    if "completed" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Completed' ORDER BY amount DESC"
+    if "cancelled" in q_lower or "canceled" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Cancelled' ORDER BY amount DESC"
+
+    # 5. Counting & Cardinality queries
     if any(k in q_lower for k in ["how many orders", "count orders", "number of orders", "total orders"]):
         if "status" in q_lower:
             return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS total_revenue FROM orders GROUP BY status ORDER BY order_count DESC"
@@ -116,7 +141,7 @@ def _heuristic_sql_generator(
     if "by status" in q_lower or "status distribution" in q_lower or "orders by status" in q_lower:
         return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS total_revenue FROM orders GROUP BY status ORDER BY order_count DESC"
 
-    # 5. Revenue & Sales Aggregations
+    # 6. Revenue & Sales Aggregations
     if any(k in q_lower for k in ["total revenue", "total sales", "overall revenue"]):
         if "customer" in q_lower:
             return "SELECT customer_name, ROUND(SUM(amount), 2) AS total_spent, COUNT(*) AS orders_count FROM orders GROUP BY customer_name ORDER BY total_spent DESC"
@@ -133,7 +158,7 @@ def _heuristic_sql_generator(
     if "average order" in q_lower or "avg order" in q_lower or "average amount" in q_lower:
         return "SELECT ROUND(AVG(amount), 2) AS average_order_amount, ROUND(MIN(amount), 2) AS min_amount, ROUND(MAX(amount), 2) AS max_amount FROM orders"
 
-    # 6. Numeric comparisons & filters
+    # 7. Numeric comparisons & filters
     gt_match = re.search(r"(?:greater than|more than|above|over|>)\s*(\d+(?:\.\d+)?)", q_lower)
     if gt_match:
         val = gt_match.group(1)
@@ -148,12 +173,12 @@ def _heuristic_sql_generator(
             return f"SELECT product_name, category, price, stock FROM products WHERE price < {val} ORDER BY price ASC"
         return f"SELECT id, order_date, customer_name, amount, status FROM orders WHERE amount < {val} ORDER BY amount ASC"
 
-    # 7. Product specific searches
+    # 8. Product specific searches
     for prod in ["keyboard", "mouse", "monitor", "chair", "converter", "notebook"]:
         if prod in q_lower:
             return f"SELECT product_name, category, price, stock FROM products WHERE LOWER(product_name) LIKE '%{prod}%'"
 
-    # 8. Category & Product queries
+    # 9. Category & Product queries
     if "electronics" in q_lower:
         return "SELECT product_name, category, price, stock FROM products WHERE category = 'Electronics' ORDER BY price DESC"
     if "furniture" in q_lower:
@@ -169,18 +194,22 @@ def _heuristic_sql_generator(
     if "low stock" in q_lower or "lowest stock" in q_lower:
         return "SELECT product_name, category, price, stock FROM products ORDER BY stock ASC LIMIT 3"
 
-    if "average price" in q_lower or "category" in q_lower:
+    if "average price" in q_lower:
         return "SELECT category, COUNT(*) AS product_count, ROUND(AVG(price), 2) AS avg_price, SUM(stock) AS total_stock FROM products GROUP BY category ORDER BY product_count DESC"
 
-    # 9. Date sorting queries (Test Case 1)
+    # 10. Date sorting queries (Test Case 1 — must come AFTER the sort_match block above)
     if "orders sorted by date" in q_lower or ("order" in q_lower and "date" in q_lower):
         return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY order_date ASC"
 
-    # 10. Customer listings
+    # 11. Customer listings
     if "customer" in q_lower and ("list" in q_lower or "show" in q_lower or "all" in q_lower):
         return "SELECT DISTINCT customer_name FROM orders ORDER BY customer_name ASC"
 
-    # 11. General tables
+    # 12. Category aggregation fallback (after all specific checks)
+    if "category" in q_lower:
+        return "SELECT category, COUNT(*) AS product_count, ROUND(AVG(price), 2) AS avg_price, SUM(stock) AS total_stock FROM products GROUP BY category ORDER BY product_count DESC"
+
+    # 13. General product listing
     if "product" in q_lower:
         return "SELECT id, product_name, category, price, stock FROM products ORDER BY id ASC"
 
