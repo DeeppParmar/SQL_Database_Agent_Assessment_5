@@ -1,7 +1,7 @@
 # SQL & Database Analytics Agent
-- **Repository**: [Insert URL]
+- **Repository**: [https://github.com/DeeppParmar/SQL_Database_Agent_Assessment_5](https://github.com/DeeppParmar/SQL_Database_Agent_Assessment_5)
 
-An enterprise-ready text-to-SQL analytics agent designed with **LangGraph**, featuring an automated **Self-Correction Reflection Loop**, **Abstract Syntax Tree (AST)** security filters, **NeMo Guardrails** input protection, and an interactive **Streamlit** analytics dashboard powered by **Plotly**.
+An enterprise-ready text-to-SQL analytics agent designed with **LangGraph**, featuring an automated **Self-Correction Reflection Loop**, **Abstract Syntax Tree (AST)** security filters, **NeMo Guardrails** input protection, dynamic **NL-to-SQL intent parsing**, and an interactive **Streamlit** analytics dashboard powered by **Plotly**.
 
 ---
 
@@ -66,6 +66,8 @@ Or run directly via command-line flags:
 - `run.bat all` - Seeds database, runs all 15 tests, and launches the UI dashboard
 - `run.bat ui` - Launches Streamlit analytics dashboard directly
 - `run.bat test` - Runs full automated test suite (`pytest`)
+- `run.bat tc1` - Runs automated live verification for Test Case 1 (Reflection Recovery)
+- `run.bat tc2` - Runs automated live verification for Test Case 2 (AST & NeMo Injection Block)
 - `run.bat seed` - Seeds sample `orders` and `products` tables
 - `run.bat install` - Installs Python dependencies
 
@@ -84,7 +86,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4o-mini
 DATABASE_URL=sqlite:///analytics.db
 ```
-*(Note: If `OPENAI_API_KEY` is omitted, the agent automatically activates an offline heuristic generator that demonstrates full text-to-SQL generation and dynamic reflection recovery).*
+*(Note: If `OPENAI_API_KEY` is omitted, the agent automatically activates an intelligent offline dynamic NL-to-SQL parser that builds SQL queries from scratch based on user intent, filters, aggregations, and sorting, supporting dynamic reflection recovery).*
 
 ### 2. Install dependencies
 ```bash
@@ -115,9 +117,9 @@ pytest
 The project satisfies all required test cases specified in the evaluation brief:
 
 ### Test Case 1: SQL Self-Correction column-reference recovery loop
-1. Seed database using `python seed_db.py`.
-2. Start the Streamlit application: `streamlit run app.py`.
-3. In the sidebar, select **"Simulate Column Error (Self-Correction Test)"** and run query:
+1. Seed database using `python seed_db.py` (or `run.bat seed`).
+2. Start the Streamlit application: `streamlit run app.py` (or `run.bat ui`).
+3. In the sidebar under **Simulation Mode**, select **"Force Column Error (Test Case 1: created_at)"** and run query:
    `Show orders sorted by date`
 4. **Result:**
    - On attempt 1, the model simulates generating a query using non-existent column `created_at`.
@@ -125,6 +127,7 @@ The project satisfies all required test cases specified in the evaluation brief:
    - `reflection_node` activates (Retry 1/3), inspects schema metadata, and synthesizes a correction directive with valid column `order_date`.
    - `generate_sql_node` rewrites query to `SELECT ... FROM orders ORDER BY order_date ASC`.
    - Results are rendered in the table and Plotly chart canvas.
+   *(Alternatively, run `run.bat tc1` to execute the automated CLI verification).*
 
 ### Test Case 2: AST Safety Filter & SQL Injection Block
 1. In Streamlit or test suite, input the malicious attack query:
@@ -133,7 +136,8 @@ The project satisfies all required test cases specified in the evaluation brief:
    - NeMo Guardrails and the AST safety filter intercept the command before execution.
    - A security warning is displayed: `Security Warning [NeMo Guardrails]: Destructive SQL statement injection detected`.
    - The query is aborted without querying the database.
-   - The `orders` table remains completely intact.
+   - The `orders` table remains completely intact (all 7 records preserved).
+   *(Alternatively, run `run.bat tc2` to execute the automated CLI verification).*
 
 ### Test Case 3: Automated Test Suite Execution
 Run the full test suite:
@@ -157,12 +161,14 @@ All 15 tests verify:
 ├── .gitignore                # Git ignore rules
 ├── README.md                 # Project documentation and evaluation guide
 ├── requirements.txt          # Python package dependencies
+├── run.bat                   # All-in-one Windows batch runner
+├── verify_cases.py           # Verification script for Test Case 1 & 2
 ├── seed_db.py                # Database seeder script
 ├── app.py                    # Streamlit Dashboard application entrypoint
 ├── app/
 │   ├── __init__.py
-│   ├── agent.py              # LangGraph StateGraph Text-to-SQL & Reflection loop
-│   ├── db.py                 # SQLAlchemy connection & schema inspection
+│   ├── agent.py              # LangGraph StateGraph Text-to-SQL, NL Parser & Reflection loop
+│   ├── db.py                 # SQLAlchemy connection, telemetry & schema inspection
 │   └── guardrails.py         # AST sqlparse analyzer & NeMo Guardrails scanner
 ├── config/
 │   └── guardrails/
