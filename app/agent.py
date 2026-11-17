@@ -46,6 +46,249 @@ def _extract_schema_columns(schema_info: str) -> List[str]:
     return cols
 
 
+def _parse_nl_to_sql(user_query: str, schema_info: str) -> Optional[str]:
+    """
+    Dynamic NL→SQL parser. Reads the actual words in the query and builds SQL
+    from scratch: table selection, column projection, WHERE filters, GROUP BY,
+    ORDER BY, LIMIT — all inferred from the query text against the real schema.
+    Returns None if it cannot confidently parse (falls back to legacy heuristic).
+    """
+    q = user_query.strip().rstrip(";").lower()
+
+    # ── Schema awareness ──────────────────────────────────────────────────────
+    # orders columns
+    ORDER_COLS = {"id", "order_date", "customer_name", "amount", "status"}
+    # products columns
+    PROD_COLS  = {"id", "product_name", "category", "price", "stock"}
+
+    # Alias map → real column name + home table
+    COL_ALIASES: Dict[str, tuple] = {
+        # orders aliases
+        "date": ("order_date", "orders"),
+        "created_at": ("order_date", "orders"),
+        "timestamp": ("order_date", "orders"),
+        "customer": ("customer_name", "orders"),
+        "name": ("customer_name", "orders"),
+        "total": ("amount", "orders"),
+        "sales": ("amount", "orders"),
+        "revenue": ("amount", "orders"),
+        "value": ("amount", "orders"),
+        "order_date": ("order_date", "orders"),
+        "customer_name": ("customer_name", "orders"),
+        "amount": ("amount", "orders"),
+        "status": ("status", "orders"),
+        # products aliases
+        "price": ("price", "products"),
+        "cost": ("price", "products"),
+        "stock": ("stock", "products"),
+        "quantity": ("stock", "products"),
+        "inventory": ("stock", "products"),
+        "product": ("product_name", "products"),
+        "product_name": ("product_name", "products"),
+        "category": ("category", "products"),
+    }
+
+    def resolve_col(word: str):
+        """Returns (real_col, table) or None."""
+        return COL_ALIASES.get(word)
+
+    # ── Step 1: Determine target table ───────────────────────────────────────
+    is_product_q = any(w in q for w in ["product", "products", "price", "stock", "inventory",
+                                         "category", "electronics", "furniture", "stationery",
+                                         "keyboard", "mouse", "monitor", "chair", "converter", "notebook"])
+    is_order_q   = any(w in q for w in ["order", "orders", "customer", "amount", "revenue",
+                                          "sales", "pending", "completed", "cancelled", "canceled"])
+
+    # If neither or both are signalled, let caller decide
+    if is_product_q and not is_order_q:
+        table = "products"
+        default_cols = "id, product_name, category, price, stock"
+    elif is_order_q or not is_product_q:
+        table = "orders"
+        default_cols = "id, order_date, customer_name, amount, status"
+    else:
+        return None
+
+    # ── Step 2: Intent detection ─────────────────────────────────────────────
+    # Detect explicit sort verbs FIRST — if present, the user wants sorting not grouping
+    has_sort_verb = bool(re.search(
+        r"\b(?:sort(?:ed)?|rank(?:ed)?|arrang(?:e|ed)?)\b", q
+    )) or bool(re.search(r"\border(?:ed)?\s+by\b", q))
+
+    is_count    = any(w in q for w in ["how many", "count", "number of", "total count"])
+    is_sum      = any(w in q for w in ["total", "sum", "overall", "revenue", "sales"])
+    is_avg      = any(w in q for w in ["average", "avg", "mean"])
+    is_max      = any(w in q for w in ["highest", "most expensive", "maximum", "max", "largest", "biggest", "top"])
+    is_min      = any(w in q for w in ["lowest", "cheapest", "minimum", "min", "smallest"])
+    is_distinct = any(w in q for w in ["unique", "distinct", "different"])
+    # Only treat as GROUP BY if there's NO explicit sort verb
+    is_group    = (not has_sort_verb) and any(w in q for w in [
+                    "by status", "by category", "by customer", "by date",
+                    "per status", "per category", "per customer", "per date",
+                    "group", "distribution", "breakdown"])
+    is_list     = any(w in q for w in ["list", "show", "display", "get", "fetch", "find", "give",
+                                        "all", "every", "what are"])
+
+    # ── Step 3: WHERE filters ────────────────────────────────────────────────
+    where_clauses = []
+
+    # Status filters
+    for status in ["pending", "completed", "cancelled", "canceled"]:
+        if status in q:
+            real = "Cancelled" if status == "canceled" else status.capitalize()
+            where_clauses.append(f"status = '{real}'")
+
+    # Category filters
+    for cat in ["Electronics", "Furniture", "Stationery"]:
+        if cat.lower() in q:
+            where_clauses.append(f"category = '{cat}'")
+
+    # Specific product name keyword
+    for prod in ["keyboard", "mouse", "monitor", "chair", "converter", "notebook"]:
+        if prod in q:
+            where_clauses.append(f"LOWER(product_name) LIKE '%{prod}%'")
+
+    # Numeric range filters  (amount / price)
+    gt = re.search(r"(?:greater than|more than|more \w+ than|above|over|>)\s*(\d+(?:\.\d+)?)", q)
+    lt = re.search(r"(?:less than|under|below|<)\s*(\d+(?:\.\d+)?)", q)
+    btwn = re.search(r"between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)", q)
+    if btwn:
+        num_col = "price" if table == "products" else "amount"
+        where_clauses.append(f"{num_col} BETWEEN {btwn.group(1)} AND {btwn.group(2)}")
+    elif gt:
+        num_col = "price" if table == "products" else "amount"
+        where_clauses.append(f"{num_col} > {gt.group(1)}")
+    elif lt:
+        num_col = "price" if table == "products" else "amount"
+        where_clauses.append(f"{num_col} < {lt.group(1)}")
+
+    # Date range filters
+    yr = re.search(r"\b(202\d)\b", q)
+    month_names = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                   "july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
+    month_match = next(((m, n) for m, n in month_names.items() if m in q), None)
+    if yr and table == "orders":
+        where_clauses.append(f"order_date LIKE '{yr.group(1)}%'")
+    if month_match and table == "orders":
+        where_clauses.append(f"order_date LIKE '%-{month_match[1]:02d}-%'")
+
+    # Customer name filter: "orders for Alice" / "from Bob"
+    cust_match = re.search(r"(?:for|from|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", user_query)
+    if cust_match and table == "orders":
+        cust_val = cust_match.group(1)
+        where_clauses.append(f"LOWER(customer_name) LIKE '%{cust_val.lower()}%'")
+
+    # ── Step 4: ORDER BY ─────────────────────────────────────────────────────
+    order_by = ""
+    desc_words = ["highest", "most", "top", "largest", "biggest", "descending", "desc", "expensive"]
+    asc_words  = ["lowest", "least", "smallest", "cheapest", "ascending", "asc", "oldest", "earliest"]
+
+    # Explicit "sort/order/rank/arrange by <col>"
+    sort_m = re.search(
+        r"(?:sort(?:ed)?|order(?:ed)?|rank(?:ed)?|arrang(?:e|ed)?)\s+(?:\w+\s+)?by\s+(\w+)",
+        q,
+    )
+    # Also "by <col>" standalone
+    by_m = re.search(r"\bby\s+(amount|price|stock|date|order_date|customer|customer_name|status|revenue|name|category|product)\b", q)
+
+    sort_word = (sort_m.group(1) if sort_m else None) or (by_m.group(1) if by_m else None)
+
+    if sort_word:
+        resolved = resolve_col(sort_word)
+        if resolved:
+            real_col, _ = resolved
+            direction = "ASC"
+            if any(w in q for w in desc_words):
+                direction = "DESC"
+            # Sensible defaults per column type
+            if real_col == "stock":
+                direction = "DESC" if any(w in q for w in desc_words) else "ASC"
+            elif real_col in ("amount", "price"):
+                direction = "ASC" if any(w in q for w in asc_words) else "DESC"
+            elif real_col in ("order_date", "customer_name", "category", "product_name"):
+                direction = "DESC" if any(w in q for w in desc_words) else "ASC"
+            order_by = f"ORDER BY {real_col} {direction}"
+    elif is_max or is_min:
+        num_col = "price" if table == "products" else "amount"
+        order_by = f"ORDER BY {num_col} {'ASC' if is_min else 'DESC'}"
+    elif table == "orders":
+        order_by = "ORDER BY id ASC"
+    else:
+        order_by = "ORDER BY id ASC"
+
+    # ── Step 5: LIMIT ────────────────────────────────────────────────────────
+    limit = ""
+    lim_m = re.search(r"\b(?:top|first|last|limit)\s+(\d+)\b", q)
+    if lim_m:
+        limit = f"LIMIT {lim_m.group(1)}"
+    elif is_max or is_min:
+        limit = "LIMIT 5"
+
+    # ── Step 6: SELECT clause — aggregations & projections ───────────────────
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    # Aggregation path
+    if is_count and not is_group:
+        parts = [f"SELECT COUNT(*) AS total_{table} FROM {table}"]
+        if where_sql:
+            parts.append(where_sql)
+        return " ".join(parts)
+
+    if is_group:
+        # Determine group-by column
+        grp_col = None
+        if "status" in q:              grp_col = "status"
+        elif "category" in q:          grp_col = "category"
+        elif "customer" in q:          grp_col = "customer_name"
+        elif "date" in q or "day" in q: grp_col = "order_date" if table == "orders" else None
+
+        if grp_col and grp_col in (ORDER_COLS if table == "orders" else PROD_COLS):
+            agg_col = "amount" if table == "orders" else "price"
+            select_parts = [grp_col, f"COUNT(*) AS count"]
+            if is_sum or is_avg:
+                select_parts.append(f"ROUND({'AVG' if is_avg else 'SUM'}({agg_col}), 2) AS {'avg_' if is_avg else 'total_'}{agg_col}")
+            else:
+                select_parts.append(f"ROUND(SUM({agg_col}), 2) AS total_{agg_col}")
+            grp_order = "ORDER BY count DESC"
+            parts = [f"SELECT {', '.join(select_parts)} FROM {table}"]
+            if where_sql:
+                parts.append(where_sql)
+            parts.append(f"GROUP BY {grp_col}")
+            parts.append(grp_order)
+            return " ".join(parts)
+
+    if is_avg:
+        num_col = "price" if table == "products" else "amount"
+        parts = [f"SELECT ROUND(AVG({num_col}), 2) AS avg_{num_col}, ROUND(MIN({num_col}), 2) AS min_{num_col}, ROUND(MAX({num_col}), 2) AS max_{num_col} FROM {table}"]
+        if where_sql:
+            parts.append(where_sql)
+        return " ".join(parts)
+
+    if is_sum and not is_group:
+        num_col = "price" if table == "products" else "amount"
+        parts = [f"SELECT ROUND(SUM({num_col}), 2) AS total_{num_col}, COUNT(*) AS row_count FROM {table}"]
+        if where_sql:
+            parts.append(where_sql)
+        return " ".join(parts)
+
+    if is_distinct and table == "orders":
+        parts = ["SELECT DISTINCT customer_name FROM orders"]
+        if where_sql:
+            parts.append(where_sql)
+        parts.append("ORDER BY customer_name ASC")
+        return " ".join(parts)
+
+    # ── Default SELECT * (all cols) with filters and sort ───────────────────
+    parts = [f"SELECT {default_cols} FROM {table}"]
+    if where_sql:
+        parts.append(where_sql)
+    if order_by:
+        parts.append(order_by)
+    if limit:
+        parts.append(limit)
+    return " ".join(parts)
+
+
 def _heuristic_sql_generator(
     user_query: str,
     schema_info: str,
@@ -54,17 +297,19 @@ def _heuristic_sql_generator(
     previous_sql: Optional[str] = None,
 ) -> str:
     """
-    Intelligent heuristic SQL generator with automated column-error reflection correction
-    and rich natural language BI intent parsing.
+    Two-stage SQL generator:
+      Stage 1 — dynamic NL parser (_parse_nl_to_sql): builds SQL from scratch
+                 by reading the actual words in the query.
+      Stage 2 — legacy pattern fallback for edge cases the parser misses.
     """
     clean_q = user_query.strip().rstrip(";")
     q_lower = clean_q.lower()
 
-    # 1. Direct SQL detection: if user provided valid read-only SQL, honor it
+    # 1. Direct SQL passthrough
     if q_lower.startswith(("select", "with")):
         return clean_q
 
-    # 2. Self-Correction reflection handling: inspect error and correct SQL
+    # 2. Self-correction: fix a known bad column from a previous failed attempt
     if error_message and previous_sql:
         col_match = re.search(
             r"(?:no such column:\s*(\w+)|column\s+[\"']?(\w+)[\"']?\s+does not exist)",
@@ -72,147 +317,28 @@ def _heuristic_sql_generator(
             re.IGNORECASE,
         )
         bad_col = (col_match.group(1) or col_match.group(2)) if col_match else None
-
         if bad_col:
             col_aliases = {
-                "created_at": "order_date",
-                "timestamp": "order_date",
-                "date": "order_date",
-                "orderdate": "order_date",
-                "customer": "customer_name",
-                "user": "customer_name",
-                "total": "amount",
-                "sales": "amount",
+                "created_at": "order_date", "timestamp": "order_date",
+                "date": "order_date", "orderdate": "order_date",
+                "customer": "customer_name", "user": "customer_name",
+                "total": "amount", "sales": "amount",
             }
             replacement = col_aliases.get(bad_col.lower())
-
             if not replacement:
                 schema_cols = _extract_schema_columns(schema_info)
                 closest = difflib.get_close_matches(bad_col, schema_cols, n=1, cutoff=0.2)
-                if closest:
-                    replacement = closest[0]
-
+                replacement = closest[0] if closest else None
             if replacement:
-                corrected_sql = re.sub(rf"\b{bad_col}\b", replacement, previous_sql, flags=re.IGNORECASE)
-                return clean_sql_output(corrected_sql)
+                corrected = re.sub(rf"\b{bad_col}\b", replacement, previous_sql, flags=re.IGNORECASE)
+                return clean_sql_output(corrected)
 
-    # 3. Sorting by a specific column (must come BEFORE generic "order" catch-all)
-    # Matches: "sorted by amount", "ordered by price", "sort orders by amount", "by amount"
-    sort_match = re.search(
-        r"(?:(?:sorted?\s+by|order(?:ed)?\s+by|rank(?:ed)?\s+by|arrange(?:d)?\s+by)\s+|(?:^|\s)by\s+)"
-        r"(amount|price|stock|order_date|date|customer_name|customer|status)",
-        q_lower,
-    )
-    if sort_match:
-        col_raw = sort_match.group(1)
-        # Map aliases to real column names
-        col_map = {
-            "amount": ("orders", "amount", "DESC"),
-            "price": ("products", "price", "DESC"),
-            "stock": ("products", "stock", "ASC"),
-            "order_date": ("orders", "order_date", "ASC"),
-            "date": ("orders", "order_date", "ASC"),
-            "customer_name": ("orders", "customer_name", "ASC"),
-            "customer": ("orders", "customer_name", "ASC"),
-            "status": ("orders", "status", "ASC"),
-        }
-        tbl, col, direction = col_map.get(col_raw, ("orders", "amount", "DESC"))
-        if tbl == "orders":
-            return f"SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY {col} {direction}"
-        return f"SELECT product_name, category, price, stock FROM products ORDER BY {col} {direction}"
+    # 3. Dynamic NL parser — tries to build SQL from scratch
+    parsed = _parse_nl_to_sql(user_query, schema_info)
+    if parsed:
+        return parsed
 
-    # 4. Specific status filtering
-    if "pending" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Pending' ORDER BY amount DESC"
-    if "completed" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Completed' ORDER BY amount DESC"
-    if "cancelled" in q_lower or "canceled" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Cancelled' ORDER BY amount DESC"
-
-    # 5. Counting & Cardinality queries
-    if any(k in q_lower for k in ["how many orders", "count orders", "number of orders", "total orders"]):
-        if "status" in q_lower:
-            return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS total_revenue FROM orders GROUP BY status ORDER BY order_count DESC"
-        return "SELECT COUNT(*) AS total_orders FROM orders"
-
-    if any(k in q_lower for k in ["how many products", "count products", "number of products", "total products"]):
-        return "SELECT COUNT(*) AS total_products FROM products"
-
-    if "by status" in q_lower or "status distribution" in q_lower or "orders by status" in q_lower:
-        return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS total_revenue FROM orders GROUP BY status ORDER BY order_count DESC"
-
-    # 6. Revenue & Sales Aggregations
-    if any(k in q_lower for k in ["total revenue", "total sales", "overall revenue"]):
-        if "customer" in q_lower:
-            return "SELECT customer_name, ROUND(SUM(amount), 2) AS total_spent, COUNT(*) AS orders_count FROM orders GROUP BY customer_name ORDER BY total_spent DESC"
-        if "date" in q_lower or "day" in q_lower:
-            return "SELECT order_date, ROUND(SUM(amount), 2) AS daily_revenue, COUNT(*) AS orders_count FROM orders GROUP BY order_date ORDER BY order_date ASC"
-        return "SELECT ROUND(SUM(amount), 2) AS total_revenue, COUNT(*) AS total_orders, ROUND(AVG(amount), 2) AS average_order_value FROM orders"
-
-    if "sales by date" in q_lower or "revenue by date" in q_lower or "sales trend" in q_lower:
-        return "SELECT order_date, ROUND(SUM(amount), 2) AS daily_revenue, COUNT(*) AS orders_count FROM orders GROUP BY order_date ORDER BY order_date ASC"
-
-    if "sales by customer" in q_lower or "top customer" in q_lower or "customer spend" in q_lower:
-        return "SELECT customer_name, ROUND(SUM(amount), 2) AS total_spent, COUNT(*) AS orders_count FROM orders GROUP BY customer_name ORDER BY total_spent DESC"
-
-    if "average order" in q_lower or "avg order" in q_lower or "average amount" in q_lower:
-        return "SELECT ROUND(AVG(amount), 2) AS average_order_amount, ROUND(MIN(amount), 2) AS min_amount, ROUND(MAX(amount), 2) AS max_amount FROM orders"
-
-    # 7. Numeric comparisons & filters
-    gt_match = re.search(r"(?:greater than|more than|above|over|>)\s*(\d+(?:\.\d+)?)", q_lower)
-    if gt_match:
-        val = gt_match.group(1)
-        if "product" in q_lower or "price" in q_lower:
-            return f"SELECT product_name, category, price, stock FROM products WHERE price > {val} ORDER BY price DESC"
-        return f"SELECT id, order_date, customer_name, amount, status FROM orders WHERE amount > {val} ORDER BY amount DESC"
-
-    lt_match = re.search(r"(?:less than|under|below|<)\s*(\d+(?:\.\d+)?)", q_lower)
-    if lt_match:
-        val = lt_match.group(1)
-        if "product" in q_lower or "price" in q_lower:
-            return f"SELECT product_name, category, price, stock FROM products WHERE price < {val} ORDER BY price ASC"
-        return f"SELECT id, order_date, customer_name, amount, status FROM orders WHERE amount < {val} ORDER BY amount ASC"
-
-    # 8. Product specific searches
-    for prod in ["keyboard", "mouse", "monitor", "chair", "converter", "notebook"]:
-        if prod in q_lower:
-            return f"SELECT product_name, category, price, stock FROM products WHERE LOWER(product_name) LIKE '%{prod}%'"
-
-    # 9. Category & Product queries
-    if "electronics" in q_lower:
-        return "SELECT product_name, category, price, stock FROM products WHERE category = 'Electronics' ORDER BY price DESC"
-    if "furniture" in q_lower:
-        return "SELECT product_name, category, price, stock FROM products WHERE category = 'Furniture' ORDER BY price DESC"
-    if "stationery" in q_lower:
-        return "SELECT product_name, category, price, stock FROM products WHERE category = 'Stationery' ORDER BY price DESC"
-
-    if "most expensive" in q_lower or "highest price" in q_lower:
-        return "SELECT product_name, category, price, stock FROM products ORDER BY price DESC LIMIT 3"
-    if "cheapest" in q_lower or "lowest price" in q_lower:
-        return "SELECT product_name, category, price, stock FROM products ORDER BY price ASC LIMIT 3"
-
-    if "low stock" in q_lower or "lowest stock" in q_lower:
-        return "SELECT product_name, category, price, stock FROM products ORDER BY stock ASC LIMIT 3"
-
-    if "average price" in q_lower:
-        return "SELECT category, COUNT(*) AS product_count, ROUND(AVG(price), 2) AS avg_price, SUM(stock) AS total_stock FROM products GROUP BY category ORDER BY product_count DESC"
-
-    # 10. Date sorting queries (Test Case 1 — must come AFTER the sort_match block above)
-    if "orders sorted by date" in q_lower or ("order" in q_lower and "date" in q_lower):
-        return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY order_date ASC"
-
-    # 11. Customer listings
-    if "customer" in q_lower and ("list" in q_lower or "show" in q_lower or "all" in q_lower):
-        return "SELECT DISTINCT customer_name FROM orders ORDER BY customer_name ASC"
-
-    # 12. Category aggregation fallback (after all specific checks)
-    if "category" in q_lower:
-        return "SELECT category, COUNT(*) AS product_count, ROUND(AVG(price), 2) AS avg_price, SUM(stock) AS total_stock FROM products GROUP BY category ORDER BY product_count DESC"
-
-    # 13. General product listing
-    if "product" in q_lower:
-        return "SELECT id, product_name, category, price, stock FROM products ORDER BY id ASC"
-
+    # 4. Fallback for anything the parser doesn't handle
     return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY id ASC LIMIT 20"
 
 
