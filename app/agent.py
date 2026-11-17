@@ -22,6 +22,7 @@ class AgentState(TypedDict):
     schema_info: Optional[str]
     reflection_prompt: Optional[str]
     telemetry: List[str]
+    sql_history: List[str]
 
 
 def clean_sql_output(raw_text: str) -> str:
@@ -53,18 +54,26 @@ def _heuristic_sql_generator(
     previous_sql: Optional[str] = None,
 ) -> str:
     """
-    Intelligent heuristic SQL generator with automated column-error reflection correction.
+    Intelligent heuristic SQL generator with automated column-error reflection correction
+    and rich natural language BI intent parsing.
     """
-    q_lower = user_query.lower()
+    clean_q = user_query.strip().rstrip(";")
+    q_lower = clean_q.lower()
 
-    # Self-Correction reflection handling: inspect error and correct SQL
+    # 1. Direct SQL detection: if user provided valid read-only SQL, honor it
+    if q_lower.startswith(("select", "with")):
+        return clean_q
+
+    # 2. Self-Correction reflection handling: inspect error and correct SQL
     if error_message and previous_sql:
-        # Check for SQLite: "no such column: <col>" or Postgres: "column '<col>' does not exist"
-        col_match = re.search(r"(?:no such column:\s*(\w+)|column\s+[\"']?(\w+)[\"']?\s+does not exist)", error_message, re.IGNORECASE)
+        col_match = re.search(
+            r"(?:no such column:\s*(\w+)|column\s+[\"']?(\w+)[\"']?\s+does not exist)",
+            error_message,
+            re.IGNORECASE,
+        )
         bad_col = (col_match.group(1) or col_match.group(2)) if col_match else None
 
         if bad_col:
-            # Semantic column mapping for common text-to-SQL mistakes
             col_aliases = {
                 "created_at": "order_date",
                 "timestamp": "order_date",
@@ -87,22 +96,95 @@ def _heuristic_sql_generator(
                 corrected_sql = re.sub(rf"\b{bad_col}\b", replacement, previous_sql, flags=re.IGNORECASE)
                 return clean_sql_output(corrected_sql)
 
-    # Standard analytical queries
+    # 3. Specific status filtering
+    if "pending" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Pending' ORDER BY id ASC"
+    if "completed" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Completed' ORDER BY id ASC"
+    if "cancelled" in q_lower or "canceled" in q_lower:
+        return "SELECT id, order_date, customer_name, amount, status FROM orders WHERE status = 'Cancelled' ORDER BY id ASC"
+
+    # 4. Counting & Cardinality queries
+    if any(k in q_lower for k in ["how many orders", "count orders", "number of orders", "total orders"]):
+        if "status" in q_lower:
+            return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS total_revenue FROM orders GROUP BY status ORDER BY order_count DESC"
+        return "SELECT COUNT(*) AS total_orders FROM orders"
+
+    if any(k in q_lower for k in ["how many products", "count products", "number of products", "total products"]):
+        return "SELECT COUNT(*) AS total_products FROM products"
+
+    if "by status" in q_lower or "status distribution" in q_lower or "orders by status" in q_lower:
+        return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS total_revenue FROM orders GROUP BY status ORDER BY order_count DESC"
+
+    # 5. Revenue & Sales Aggregations
+    if any(k in q_lower for k in ["total revenue", "total sales", "overall revenue"]):
+        if "customer" in q_lower:
+            return "SELECT customer_name, ROUND(SUM(amount), 2) AS total_spent, COUNT(*) AS orders_count FROM orders GROUP BY customer_name ORDER BY total_spent DESC"
+        if "date" in q_lower or "day" in q_lower:
+            return "SELECT order_date, ROUND(SUM(amount), 2) AS daily_revenue, COUNT(*) AS orders_count FROM orders GROUP BY order_date ORDER BY order_date ASC"
+        return "SELECT ROUND(SUM(amount), 2) AS total_revenue, COUNT(*) AS total_orders, ROUND(AVG(amount), 2) AS average_order_value FROM orders"
+
+    if "sales by date" in q_lower or "revenue by date" in q_lower or "sales trend" in q_lower:
+        return "SELECT order_date, ROUND(SUM(amount), 2) AS daily_revenue, COUNT(*) AS orders_count FROM orders GROUP BY order_date ORDER BY order_date ASC"
+
+    if "sales by customer" in q_lower or "top customer" in q_lower or "customer spend" in q_lower:
+        return "SELECT customer_name, ROUND(SUM(amount), 2) AS total_spent, COUNT(*) AS orders_count FROM orders GROUP BY customer_name ORDER BY total_spent DESC"
+
+    if "average order" in q_lower or "avg order" in q_lower or "average amount" in q_lower:
+        return "SELECT ROUND(AVG(amount), 2) AS average_order_amount, ROUND(MIN(amount), 2) AS min_amount, ROUND(MAX(amount), 2) AS max_amount FROM orders"
+
+    # 6. Numeric comparisons & filters
+    gt_match = re.search(r"(?:greater than|more than|above|over|>)\s*(\d+(?:\.\d+)?)", q_lower)
+    if gt_match:
+        val = gt_match.group(1)
+        if "product" in q_lower or "price" in q_lower:
+            return f"SELECT product_name, category, price, stock FROM products WHERE price > {val} ORDER BY price DESC"
+        return f"SELECT id, order_date, customer_name, amount, status FROM orders WHERE amount > {val} ORDER BY amount DESC"
+
+    lt_match = re.search(r"(?:less than|under|below|<)\s*(\d+(?:\.\d+)?)", q_lower)
+    if lt_match:
+        val = lt_match.group(1)
+        if "product" in q_lower or "price" in q_lower:
+            return f"SELECT product_name, category, price, stock FROM products WHERE price < {val} ORDER BY price ASC"
+        return f"SELECT id, order_date, customer_name, amount, status FROM orders WHERE amount < {val} ORDER BY amount ASC"
+
+    # 7. Product specific searches
+    for prod in ["keyboard", "mouse", "monitor", "chair", "converter", "notebook"]:
+        if prod in q_lower:
+            return f"SELECT product_name, category, price, stock FROM products WHERE LOWER(product_name) LIKE '%{prod}%'"
+
+    # 8. Category & Product queries
+    if "electronics" in q_lower:
+        return "SELECT product_name, category, price, stock FROM products WHERE category = 'Electronics' ORDER BY price DESC"
+    if "furniture" in q_lower:
+        return "SELECT product_name, category, price, stock FROM products WHERE category = 'Furniture' ORDER BY price DESC"
+    if "stationery" in q_lower:
+        return "SELECT product_name, category, price, stock FROM products WHERE category = 'Stationery' ORDER BY price DESC"
+
+    if "most expensive" in q_lower or "highest price" in q_lower:
+        return "SELECT product_name, category, price, stock FROM products ORDER BY price DESC LIMIT 3"
+    if "cheapest" in q_lower or "lowest price" in q_lower:
+        return "SELECT product_name, category, price, stock FROM products ORDER BY price ASC LIMIT 3"
+
+    if "low stock" in q_lower or "lowest stock" in q_lower:
+        return "SELECT product_name, category, price, stock FROM products ORDER BY stock ASC LIMIT 3"
+
+    if "average price" in q_lower or "category" in q_lower:
+        return "SELECT category, COUNT(*) AS product_count, ROUND(AVG(price), 2) AS avg_price, SUM(stock) AS total_stock FROM products GROUP BY category ORDER BY product_count DESC"
+
+    # 9. Date sorting queries (Test Case 1)
     if "orders sorted by date" in q_lower or ("order" in q_lower and "date" in q_lower):
         return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY order_date ASC"
 
-    if "sales" in q_lower or "revenue" in q_lower or "total amount" in q_lower:
-        return "SELECT order_date, SUM(amount) AS total_sales FROM orders GROUP BY order_date ORDER BY order_date ASC"
+    # 10. Customer listings
+    if "customer" in q_lower and ("list" in q_lower or "show" in q_lower or "all" in q_lower):
+        return "SELECT DISTINCT customer_name FROM orders ORDER BY customer_name ASC"
 
+    # 11. General tables
     if "product" in q_lower:
-        if "price" in q_lower or "expensive" in q_lower:
-            return "SELECT product_name, category, price, stock FROM products ORDER BY price DESC"
-        return "SELECT category, COUNT(*) AS product_count, AVG(price) AS avg_price FROM products GROUP BY category"
+        return "SELECT id, product_name, category, price, stock FROM products ORDER BY id ASC"
 
-    if "order" in q_lower:
-        return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY id ASC LIMIT 20"
-
-    return "SELECT * FROM orders LIMIT 10"
+    return "SELECT id, order_date, customer_name, amount, status FROM orders ORDER BY id ASC LIMIT 20"
 
 
 def generate_sql_llm(
@@ -184,6 +266,7 @@ def generate_sql_node(
         force_invalid_column=(force_invalid_column and retry_count == 0),
     )
 
+    history = state.get("sql_history", []) + [sql]
     logs = state.get("telemetry", [])
     logs.append(f"Generated SQL (Attempt {retry_count + 1}): {sql}")
 
@@ -191,9 +274,9 @@ def generate_sql_node(
     if not is_safe_select_only(sql):
         err = f"Security Violation: AST parser rejected non-read-only operation in SQL: '{sql}'"
         logs.append(f"AST Safety Filter: BLOCKED. {err}")
-        return {"generated_sql": sql, "error_message": err, "telemetry": logs}
+        return {"generated_sql": sql, "error_message": err, "telemetry": logs, "sql_history": history}
 
-    return {"generated_sql": sql, "error_message": None, "telemetry": logs}
+    return {"generated_sql": sql, "error_message": None, "telemetry": logs, "sql_history": history}
 
 
 def execute_query_node(state: AgentState, engine: Optional[Engine] = None) -> Dict[str, Any]:
@@ -332,6 +415,7 @@ def run_analytics_agent(
         "schema_info": None,
         "reflection_prompt": None,
         "telemetry": ["NeMo Guardrails Input Check: PASSED."],
+        "sql_history": [],
     }
 
     final_state = graph.invoke(initial_state)

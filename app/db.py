@@ -76,6 +76,25 @@ def execute_sql_query(
         return False, None, str(exc)
 
 
+def get_db_stats(engine: Optional[Engine] = None) -> Dict[str, int]:
+    """
+    Returns real-time row counts for all tables in the database.
+    Used by dashboard to verify data integrity and live updates.
+    """
+    eng = engine or get_engine()
+    stats = {}
+    try:
+        inspector = inspect(eng)
+        table_names = inspector.get_table_names()
+        with eng.connect() as conn:
+            for tbl in table_names:
+                res = conn.execute(text(f"SELECT COUNT(*) FROM {tbl};"))
+                stats[tbl] = res.scalar() or 0
+    except Exception:
+        pass
+    return stats
+
+
 def seed_database(engine: Optional[Engine] = None) -> None:
     """
     Seeds database with sample tables:
